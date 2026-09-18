@@ -10,7 +10,7 @@ log=configure(settings.log_level)
 EXTENSIONS=['cogs.core','cogs.configuration','cogs.moderation','cogs.automod','cogs.security','cogs.verification','cogs.welcome','cogs.tickets','cogs.music','cogs.ai','cogs.fun','cogs.leveling','cogs.economy','cogs.giveaways','cogs.community','cogs.tempvoice','cogs.roles','cogs.custom_commands','cogs.utilities','cogs.server','cogs.health','cogs.reminders','cogs.dashboard','cogs.platform']
 class AstraCore(commands.Bot):
  def __init__(self):
-  intents=discord.Intents.default();intents.members=True;intents.message_content=True;intents.guild_messages=True;intents.guild_reactions=True;intents.voice_states=True
+  intents=discord.Intents.default();intents.members=True;intents.message_content=True;intents.guild_messages=True;intents.guild_reactions=True;intents.voice_states=True;intents.auto_moderation_configuration=True;intents.auto_moderation_execution=True
   super().__init__(command_prefix=commands.when_mentioned,intents=intents,help_command=None)
  async def setup_hook(self):
   await db.init()
