@@ -112,7 +112,7 @@ class AutoMod(commands.Cog):
                     keyword_filter=[keyword]
                 ),
                 actions=[
-                    discord.AutoModRuleAction.block_message()
+                    discord.AutoModRuleAction(discord.AutoModRuleActionType.block_message)
                 ],
                 enabled=True,
                 reason=f"AstraCore native AutoMod by {interaction.user}",
@@ -160,7 +160,7 @@ class AutoMod(commands.Cog):
                     mention_spam_limit=int(limit)
                 ),
                 actions=[
-                    discord.AutoModRuleAction.block_message()
+                    discord.AutoModRuleAction(discord.AutoModRuleActionType.block_message)
                 ],
                 enabled=True,
                 reason=f"AstraCore native AutoMod by {interaction.user}",
