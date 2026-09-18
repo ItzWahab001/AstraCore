@@ -104,6 +104,8 @@ class AutoMod(commands.Cog):
                 ephemeral=True,
             )
 
+        await interaction.response.defer(ephemeral=True)
+
         try:
             rule = await interaction.guild.create_automod_rule(
                 name=f"AstraCore • {keyword[:45]}",
@@ -118,7 +120,7 @@ class AutoMod(commands.Cog):
                 reason=f"AstraCore native AutoMod by {interaction.user}",
             )
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ Native AutoMod keyword rule created.\n"
                 f"**Rule:** `{rule.name}`\n"
                 f"**ID:** `{rule.id}`",
@@ -126,12 +128,12 @@ class AutoMod(commands.Cog):
             )
 
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Discord denied this action. AstraCore needs **Manage Server**.",
                 ephemeral=True,
             )
         except discord.HTTPException as e:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Discord API error: `{e}`",
                 ephemeral=True,
             )
@@ -152,6 +154,8 @@ class AutoMod(commands.Cog):
                 ephemeral=True,
             )
 
+        await interaction.response.defer(ephemeral=True)
+
         try:
             rule = await interaction.guild.create_automod_rule(
                 name="AstraCore • Mention Spam",
@@ -166,7 +170,7 @@ class AutoMod(commands.Cog):
                 reason=f"AstraCore native AutoMod by {interaction.user}",
             )
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ Native mention-spam rule created.\n"
                 f"**Limit:** `{limit}` mentions\n"
                 f"**Rule ID:** `{rule.id}`",
@@ -174,12 +178,12 @@ class AutoMod(commands.Cog):
             )
 
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Discord denied this action. AstraCore needs **Manage Server**.",
                 ephemeral=True,
             )
         except discord.HTTPException as e:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Discord API error: `{e}`",
                 ephemeral=True,
             )
