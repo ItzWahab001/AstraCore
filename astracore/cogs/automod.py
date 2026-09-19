@@ -84,7 +84,7 @@ class AutoMod(commands.Cog):
     @staticmethod
     def _block_action() -> discord.AutoModRuleAction:
         # In discord.py 2.x the default AutoModRuleAction is block-message.
-        return discord.AutoModRuleAction(discord.AutoModRuleActionType.block_message)
+        return discord.AutoModRuleAction()
 
     @staticmethod
     def _normalise_keywords(raw: str) -> list[str]:
@@ -319,7 +319,7 @@ class AutoMod(commands.Cog):
     async def automod_maximize(self, interaction: discord.Interaction) -> None:
         """Start AutoMod maximization without keeping the Discord interaction in thinking state."""
         await interaction.response.send_message(
-            "🛡️ **AstraCore AutoMod Maximizer started.**\\n"
+            "🛡️ **AstraCore AutoMod Maximizer started.**\n"
             "The setup is running in the background. You can continue using the server.",
             ephemeral=True,
         )
