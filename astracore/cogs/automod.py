@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections import defaultdict
@@ -97,9 +98,11 @@ class AutoMod(commands.Cog):
     @staticmethod
     async def _fetch_rules(guild: discord.Guild) -> list[discord.AutoModRule]:
         try:
-            return await guild.fetch_automod_rules()
+            return await asyncio.wait_for(guild.fetch_automod_rules(), timeout=12)
         except discord.NotFound:
             return []
+        except asyncio.TimeoutError as exc:
+            raise discord.HTTPException(discord.http.Route("GET", "/guilds/{guild_id}/auto-moderation/rules", guild_id=guild.id), "AutoMod request timed out") from exc
 
     async def _create_keyword_rule(
         self,
@@ -130,55 +133,60 @@ class AutoMod(commands.Cog):
         return any(rule.name == name for rule in rules)
 
     async def _ensure_baseline(self, guild: discord.Guild) -> tuple[list[str], list[str], list[str], int]:
-        """Create only missing, useful native rules in one guild.
+        """Create missing useful native rules with one initial fetch.
 
-        This never deletes or duplicates rules. Discord remains the authority on
-        per-server limits; unsupported/forbidden creations are reported as failed.
+        This avoids repeatedly fetching the same rule list before every rule,
+        which can hit Discord's rate limits and leave an interaction thinking.
         """
         created: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
 
+        try:
+            existing = await self._fetch_rules(guild)
+        except (discord.Forbidden, discord.HTTPException):
+            raise
+
+        existing_names = {rule.name for rule in existing}
+
+        specs: list[tuple[str, discord.AutoModTrigger]] = []
         for name, terms in self.SETUP_RULES:
-            if await self._rule_exists(guild, name):
-                skipped.append(name)
-                continue
-            try:
-                await self._create_keyword_rule(guild, name, terms)
-                created.append(name)
-            except (discord.Forbidden, discord.HTTPException, ValueError):
-                failed.append(name)
+            specs.append((name, discord.AutoModTrigger(keyword_filter=list(terms))))
+        specs.extend((
+            ("AstraCore • Spam Content", discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam)),
+            ("AstraCore • Mention Spam", discord.AutoModTrigger(mention_limit=10)),
+            ("AstraCore • Harmful Links", discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.harmful_link)),
+        ))
 
-        specs = (
-            ("AstraCore • Spam Content", "spam"),
-            ("AstraCore • Mention Spam", "mention"),
-            ("AstraCore • Harmful Links", "harmful_link"),
-        )
-        for name, kind in specs:
-            if await self._rule_exists(guild, name):
+        for name, trigger in specs:
+            if name in existing_names:
                 skipped.append(name)
                 continue
             try:
-                if kind == "spam":
-                    trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam)
-                elif kind == "mention":
-                    trigger = discord.AutoModTrigger(mention_limit=10)
-                else:
-                    trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.harmful_link)
-                await guild.create_automod_rule(
-                    name=name,
-                    event_type=discord.AutoModRuleEventType.message_send,
-                    trigger=trigger,
-                    actions=[self._block_action()],
-                    enabled=True,
-                    reason="AstraCore native AutoMod baseline",
+                rule = await asyncio.wait_for(
+                    guild.create_automod_rule(
+                        name=name[:100],
+                        event_type=discord.AutoModRuleEventType.message_send,
+                        trigger=trigger,
+                        actions=[self._block_action()],
+                        enabled=True,
+                        reason="AstraCore native AutoMod baseline",
+                    ),
+                    timeout=12,
                 )
-                created.append(name)
-            except (discord.Forbidden, discord.HTTPException):
+                created.append(rule.name)
+                existing_names.add(rule.name)
+            except (asyncio.TimeoutError, discord.Forbidden, discord.HTTPException, ValueError):
                 failed.append(name)
 
-        rules = await self._fetch_rules(guild)
-        return created, skipped, failed, len(rules)
+        # Return the number of rules we can verify. If the final fetch fails,
+        # use the local count rather than hanging the interaction again.
+        try:
+            final_rules = await self._fetch_rules(guild)
+            total = len(final_rules)
+        except (discord.Forbidden, discord.HTTPException):
+            total = len(existing) + len(created)
+        return created, skipped, failed, total
 
     # ------------------------------------------------------------------
     # Admin commands
