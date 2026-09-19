@@ -83,7 +83,7 @@ class AutoMod(commands.Cog):
     @staticmethod
     def _block_action() -> discord.AutoModRuleAction:
         # In discord.py 2.x the default AutoModRuleAction is block-message.
-        return discord.AutoModRuleAction()
+        return discord.AutoModRuleAction(discord.AutoModRuleActionType.block_message)
 
     @staticmethod
     def _normalise_keywords(raw: str) -> list[str]:
@@ -112,9 +112,9 @@ class AutoMod(commands.Cog):
             raise ValueError("At least one keyword is required.")
         if len(terms) > 1000:
             raise ValueError("A Discord keyword rule can contain at most 1000 terms.")
-        too_long = [term for term in terms if len(term) > 30]
+        too_long = [term for term in terms if len(term) > 60]
         if too_long:
-            raise ValueError("Each keyword must be 30 characters or fewer.")
+            raise ValueError("Each keyword must be 60 characters or fewer.")
 
         return await guild.create_automod_rule(
             name=name[:100],
@@ -128,6 +128,57 @@ class AutoMod(commands.Cog):
     async def _rule_exists(self, guild: discord.Guild, name: str) -> bool:
         rules = await self._fetch_rules(guild)
         return any(rule.name == name for rule in rules)
+
+    async def _ensure_baseline(self, guild: discord.Guild) -> tuple[list[str], list[str], list[str], int]:
+        """Create only missing, useful native rules in one guild.
+
+        This never deletes or duplicates rules. Discord remains the authority on
+        per-server limits; unsupported/forbidden creations are reported as failed.
+        """
+        created: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+
+        for name, terms in self.SETUP_RULES:
+            if await self._rule_exists(guild, name):
+                skipped.append(name)
+                continue
+            try:
+                await self._create_keyword_rule(guild, name, terms)
+                created.append(name)
+            except (discord.Forbidden, discord.HTTPException, ValueError):
+                failed.append(name)
+
+        specs = (
+            ("AstraCore • Spam Content", "spam"),
+            ("AstraCore • Mention Spam", "mention"),
+            ("AstraCore • Harmful Links", "harmful_link"),
+        )
+        for name, kind in specs:
+            if await self._rule_exists(guild, name):
+                skipped.append(name)
+                continue
+            try:
+                if kind == "spam":
+                    trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam)
+                elif kind == "mention":
+                    trigger = discord.AutoModTrigger(mention_limit=10)
+                else:
+                    trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.harmful_link)
+                await guild.create_automod_rule(
+                    name=name,
+                    event_type=discord.AutoModRuleEventType.message_send,
+                    trigger=trigger,
+                    actions=[self._block_action()],
+                    enabled=True,
+                    reason="AstraCore native AutoMod baseline",
+                )
+                created.append(name)
+            except (discord.Forbidden, discord.HTTPException):
+                failed.append(name)
+
+        rules = await self._fetch_rules(guild)
+        return created, skipped, failed, len(rules)
 
     # ------------------------------------------------------------------
     # Admin commands
@@ -207,68 +258,70 @@ class AutoMod(commands.Cog):
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.guild_only()
     async def automod_setup(self, interaction: discord.Interaction) -> None:
-        """Create a practical 5-rule baseline without duplicating existing AstraCore rules."""
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         assert guild is not None
-        created: list[str] = []
-        skipped: list[str] = []
-        failed: list[str] = []
-
         try:
-            for name, terms in self.SETUP_RULES:
-                if await self._rule_exists(guild, name):
-                    skipped.append(name)
-                    continue
-                try:
-                    await self._create_keyword_rule(guild, name, terms)
-                    created.append(name)
-                except (discord.Forbidden, discord.HTTPException, ValueError):
-                    failed.append(name)
-
-            if not await self._rule_exists(guild, "AstraCore • Spam Content"):
-                try:
-                    await guild.create_automod_rule(
-                        name="AstraCore • Spam Content",
-                        event_type=discord.AutoModRuleEventType.message_send,
-                        trigger=discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam),
-                        actions=[self._block_action()],
-                        enabled=True,
-                        reason="AstraCore native Discord spam protection",
-                    )
-                    created.append("AstraCore • Spam Content")
-                except (discord.Forbidden, discord.HTTPException):
-                    failed.append("AstraCore • Spam Content")
-            else:
-                skipped.append("AstraCore • Spam Content")
-
-            if not await self._rule_exists(guild, "AstraCore • Mention Spam"):
-                try:
-                    await guild.create_automod_rule(
-                        name="AstraCore • Mention Spam",
-                        event_type=discord.AutoModRuleEventType.message_send,
-                        trigger=discord.AutoModTrigger(mention_limit=10),
-                        actions=[self._block_action()],
-                        enabled=True,
-                        reason="AstraCore native Discord mention spam protection",
-                    )
-                    created.append("AstraCore • Mention Spam")
-                except (discord.Forbidden, discord.HTTPException):
-                    failed.append("AstraCore • Mention Spam")
-            else:
-                skipped.append("AstraCore • Mention Spam")
-
-            rules = await self._fetch_rules(guild)
-            lines = [f"**Native AutoMod rules in this server:** `{len(rules)}`"]
+            created, skipped, failed, total = await self._ensure_baseline(guild)
+            lines = [f"**Native AutoMod rules in this server:** `{total}`"]
             if created:
                 lines.append(f"✅ Created: `{len(created)}`")
             if skipped:
                 lines.append(f"↪️ Already existed: `{len(skipped)}`")
             if failed:
-                lines.append(f"⚠️ Failed: `{len(failed)}` — check Manage Server permission and Discord rule limits.")
+                lines.append(f"⚠️ Failed: `{len(failed)}` — Discord may be enforcing a server rule limit or the bot may lack permission.")
             await interaction.followup.send("\n".join(lines), ephemeral=True)
         except (discord.Forbidden, discord.HTTPException) as exc:
             await interaction.followup.send(f"❌ AutoMod setup failed: `{exc}`", ephemeral=True)
+
+    @app_commands.command(name="automod-maximize", description="Maximize useful native AutoMod protection in this server without duplicates.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_maximize(self, interaction: discord.Interaction) -> None:
+        """Provision every useful native rule AstraCore can create in this server."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        try:
+            created, skipped, failed, total = await self._ensure_baseline(guild)
+            await interaction.followup.send(
+                "🛡️ **AstraCore AutoMod Maximized**\n"
+                f"Native rules now: **{total}**\n"
+                f"✅ Created: `{len(created)}` • ↪️ Existing: `{len(skipped)}` • ⚠️ Failed: `{len(failed)}`\n\n"
+                "AstraCore only creates useful missing rules; it never deletes or duplicates existing rules.",
+                ephemeral=True,
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not maximize AutoMod: `{exc}`", ephemeral=True)
+
+    @app_commands.command(name="automod-maximize-owned", description="Maximize AutoMod in servers you own where AstraCore is installed.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def automod_maximize_owned(self, interaction: discord.Interaction) -> None:
+        """Safely apply the baseline only to servers owned by the invoking user."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = interaction.user.id
+        results: list[str] = []
+        total_before = 0
+        total_after = 0
+        for guild in self.bot.guilds:
+            if guild.owner_id != user_id:
+                continue
+            try:
+                before = len(await self._fetch_rules(guild))
+                created, _skipped, failed, after = await self._ensure_baseline(guild)
+                total_before += before
+                total_after += after
+                results.append(f"• **{guild.name}**: `{before} → {after}` rules; created `{len(created)}`, failed `{len(failed)}`")
+            except (discord.Forbidden, discord.HTTPException):
+                results.append(f"• **{guild.name}**: skipped (Discord permission/API limit)")
+        if not results:
+            results.append("• No servers owned by you were found with AstraCore installed.")
+        await interaction.followup.send(
+            "🛡️ **AstraCore AutoMod — Owned Servers**\n"
+            f"Total visible rules: `{total_before} → {total_after}`\n" + "\n".join(results),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="automod-list", description="List native Discord AutoMod rules in this server.")
     @app_commands.checks.has_permissions(manage_guild=True)
