@@ -282,35 +282,55 @@ class AutoMod(commands.Cog):
         except (discord.Forbidden, discord.HTTPException) as exc:
             await interaction.followup.send(f"❌ AutoMod setup failed: `{exc}`", ephemeral=True)
 
-    @app_commands.command(name="automod-maximize", description="Maximize useful native AutoMod protection in this server without duplicates.")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def automod_maximize(self, interaction: discord.Interaction) -> None:
-        """Provision useful native rules without allowing Discord API calls to hang the interaction."""
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        guild = interaction.guild
-        assert guild is not None
+    async def _run_automod_maximize_background(self, interaction: discord.Interaction, guild: discord.Guild) -> None:
         try:
             created, skipped, failed, total = await asyncio.wait_for(
                 self._ensure_baseline(guild),
-                timeout=35,
+                timeout=60,
             )
             await interaction.followup.send(
-                "🛡️ **AstraCore AutoMod Maximized**\n"
-                f"Native rules now: **{total}**\n"
+                "🛡️ **AstraCore AutoMod Maximized**\\n"
+                f"Native rules now: **{total}**\\n"
                 f"✅ Created: `{len(created)}` • ↪️ Existing: `{len(skipped)}` • ⚠️ Failed: `{len(failed)}`",
                 ephemeral=True,
             )
         except asyncio.TimeoutError:
             await interaction.followup.send(
-                "⚠️ **AutoMod operation timed out safely.** Discord did not answer within 35 seconds, so AstraCore stopped waiting instead of leaving the command stuck.",
+                "⚠️ **AutoMod setup timed out safely.** Discord did not respond within 60 seconds.",
                 ephemeral=True,
             )
         except (discord.Forbidden, discord.HTTPException) as exc:
             await interaction.followup.send(
-                f"❌ Could not maximize AutoMod: `{exc}`",
+                f"❌ **AutoMod setup failed:** `{exc}`",
                 ephemeral=True,
             )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ **Unexpected AutoMod error:** `{type(exc).__name__}: {exc}`",
+                ephemeral=True,
+            )
+
+    @app_commands.command(
+        name="automod-maximize",
+        description="Maximize useful native AutoMod protection in this server without duplicates.",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_maximize(self, interaction: discord.Interaction) -> None:
+        """Start AutoMod maximization without keeping the Discord interaction in thinking state."""
+        await interaction.response.send_message(
+            "🛡️ **AstraCore AutoMod Maximizer started.**\\n"
+            "The setup is running in the background. You can continue using the server.",
+            ephemeral=True,
+        )
+
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        asyncio.create_task(
+            self._run_automod_maximize_background(interaction, guild)
+        )
 
     @app_commands.command(name="automod-maximize-owned", description="Maximize AutoMod in servers you own where AstraCore is installed.")
     @app_commands.checks.has_permissions(administrator=True)
