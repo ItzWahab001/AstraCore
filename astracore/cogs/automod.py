@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import re
 import time
 from collections import defaultdict
+from typing import Iterable
 
 import discord
 from discord import app_commands
@@ -10,331 +13,324 @@ from services.config_service import get
 
 
 class AutoMod(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.last = defaultdict(list)
+    """AstraCore custom moderation plus native Discord AutoMod integration."""
 
-    # -------------------------
-    # Existing custom AutoMod
-    # -------------------------
+    SETUP_RULES = (
+        ("AstraCore • Invite Protection", ["*discord.gg/*", "*discord.com/invite/*"]),
+        ("AstraCore • Scam Gift Phrases", ["free nitro", "nitro gift", "claim nitro", "steam gift"]),
+        ("AstraCore • Suspicious Promotion", ["dm me for nitro", "free crypto", "double your crypto"]),
+    )
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.last: defaultdict[tuple[int, int], list[float]] = defaultdict(list)
+
+    # ------------------------------------------------------------------
+    # Existing AstraCore custom AutoMod layer
+    # ------------------------------------------------------------------
     @commands.Cog.listener()
-    async def on_message(self, m):
-        if m.author.bot or not m.guild:
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or not message.guild:
             return
 
-        c = await get(m.guild.id)
-        cfg = c.get("automod", {})
-
+        config = await get(message.guild.id)
+        cfg = config.get("automod", {})
         if not cfg.get("enabled", False):
             return
-
-        if any(
-            r.id in cfg.get("exempt_role_ids", [])
-            for r in getattr(m.author, "roles", [])
-        ):
+        if any(role.id in cfg.get("exempt_role_ids", []) for role in getattr(message.author, "roles", [])):
             return
 
-        reasons = []
-        txt = m.content
-
-        words = {x.lower() for x in cfg.get("bad_words", [])}
-
-        if any(
-            w and re.search(rf"\b{re.escape(w)}\b", txt, re.I)
-            for w in words
-        ):
+        reasons: list[str] = []
+        text = message.content
+        words = {str(x).lower() for x in cfg.get("bad_words", [])}
+        if any(word and re.search(rf"\b{re.escape(word)}\b", text, re.I) for word in words):
             reasons.append("blocked word")
-
-        if len(m.mentions) > int(cfg.get("mention_limit", 5)):
+        if len(message.mentions) > int(cfg.get("mention_limit", 5)):
             reasons.append("mention spam")
-
-        if "discord.gg/" in txt.lower() and cfg.get("block_invites", True):
+        if "discord.gg/" in text.lower() and cfg.get("block_invites", True):
             reasons.append("invite link")
-
-        if len(txt) > int(cfg.get("max_message_length", 4000)):
+        if len(text) > int(cfg.get("max_message_length", 4000)):
             reasons.append("message too long")
 
-        key = (m.guild.id, m.author.id)
+        key = (message.guild.id, message.author.id)
         now = time.monotonic()
-        hist = [t for t in self.last[key] if now - t < 8]
-        hist.append(now)
-        self.last[key] = hist
-
-        if len(hist) >= int(cfg.get("message_burst", 8)):
+        history = [stamp for stamp in self.last[key] if now - stamp < 8]
+        history.append(now)
+        self.last[key] = history
+        if len(history) >= int(cfg.get("message_burst", 8)):
             reasons.append("flood")
 
-        if reasons:
+        if not reasons:
+            return
+
+        try:
+            await message.delete(reason="AstraCore AutoMod: " + ", ".join(reasons))
+        except discord.HTTPException:
+            return
+
+        if cfg.get("warn_on_action", True):
             try:
-                await m.delete(
-                    reason="AstraCore AutoMod: " + ", ".join(reasons)
+                await message.channel.send(
+                    f'⚠️ {message.author.mention}, your message was removed by AutoMod: {", ".join(reasons)}.',
+                    delete_after=5,
                 )
             except discord.HTTPException:
                 return
 
-            if cfg.get("warn_on_action", True):
-                try:
-                    await m.channel.send(
-                        f'⚠️ {m.author.mention}, your message was removed by '
-                        f'AutoMod: {", ".join(reasons)}.',
-                        delete_after=5,
-                    )
-                except discord.HTTPException:
-                    return
+    # ------------------------------------------------------------------
+    # Native Discord AutoMod helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _block_action() -> discord.AutoModRuleAction:
+        # In discord.py 2.x the default AutoModRuleAction is block-message.
+        return discord.AutoModRuleAction()
 
-    # -------------------------
-    # Discord Native AutoMod
-    # -------------------------
-    @app_commands.command(
-        name="automod-keyword",
-        description="Create a native Discord AutoMod keyword rule."
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def automod_keyword(self, interaction: discord.Interaction, keyword: str):
-        if not interaction.guild:
-            return await interaction.response.send_message(
-                "❌ This command can only be used in a server.",
-                ephemeral=True,
-            )
+    @staticmethod
+    def _normalise_keywords(raw: str) -> list[str]:
+        values: list[str] = []
+        for value in raw.split(","):
+            value = value.strip()
+            if value and value not in values:
+                values.append(value)
+        return values
 
-        keyword = keyword.strip()
-
-        if not keyword or len(keyword) > 60:
-            return await interaction.response.send_message(
-                "❌ Keyword must contain 1-60 characters.",
-                ephemeral=True,
-            )
-
-        await interaction.response.defer(ephemeral=True)
-
+    @staticmethod
+    async def _fetch_rules(guild: discord.Guild) -> list[discord.AutoModRule]:
         try:
-            rule = await interaction.guild.create_automod_rule(
-                name=f"AstraCore • {keyword[:45]}",
-                event_type=discord.AutoModRuleEventType.message_send,
-                trigger=discord.AutoModTrigger(
-                    keyword_filter=[keyword]
-                ),
-                actions=[
-                    discord.AutoModRuleAction(discord.AutoModRuleActionType.block_message)
-                ],
-                enabled=True,
-                reason=f"AstraCore native AutoMod by {interaction.user}",
-            )
+            return await guild.fetch_automod_rules()
+        except discord.NotFound:
+            return []
 
-            await interaction.followup.send(
-                f"✅ Native AutoMod keyword rule created.\n"
-                f"**Rule:** `{rule.name}`\n"
-                f"**ID:** `{rule.id}`",
-                ephemeral=True,
-            )
-
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "❌ Discord denied this action. AstraCore needs **Manage Server**.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as e:
-            await interaction.followup.send(
-                f"❌ Discord API error: `{e}`",
-                ephemeral=True,
-            )
-
-    @app_commands.command(
-        name="automod-mention-spam",
-        description="Create a native Discord AutoMod mention-spam rule."
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def automod_mention_spam(
+    async def _create_keyword_rule(
         self,
-        interaction: discord.Interaction,
-        limit: app_commands.Range[int, 2, 50] = 5,
-    ):
-        if not interaction.guild:
-            return await interaction.response.send_message(
-                "❌ This command can only be used in a server.",
+        guild: discord.Guild,
+        name: str,
+        keywords: Iterable[str],
+    ) -> discord.AutoModRule:
+        terms = list(keywords)
+        if not terms:
+            raise ValueError("At least one keyword is required.")
+        if len(terms) > 1000:
+            raise ValueError("A Discord keyword rule can contain at most 1000 terms.")
+        too_long = [term for term in terms if len(term) > 30]
+        if too_long:
+            raise ValueError("Each keyword must be 30 characters or fewer.")
+
+        return await guild.create_automod_rule(
+            name=name[:100],
+            event_type=discord.AutoModRuleEventType.message_send,
+            trigger=discord.AutoModTrigger(keyword_filter=terms),
+            actions=[self._block_action()],
+            enabled=True,
+            reason="AstraCore native AutoMod setup",
+        )
+
+    async def _rule_exists(self, guild: discord.Guild, name: str) -> bool:
+        rules = await self._fetch_rules(guild)
+        return any(rule.name == name for rule in rules)
+
+    # ------------------------------------------------------------------
+    # Admin commands
+    # ------------------------------------------------------------------
+    @app_commands.command(name="automod-keyword", description="Create a native Discord AutoMod keyword rule.")
+    @app_commands.describe(name="Rule name", keywords="Comma-separated keywords or phrases")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_keyword(self, interaction: discord.Interaction, name: str, keywords: str) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            terms = self._normalise_keywords(keywords)
+            rule = await self._create_keyword_rule(interaction.guild, name, terms)  # type: ignore[arg-type]
+            await interaction.followup.send(
+                f"✅ Native AutoMod rule created: **{rule.name}**\nID: `{rule.id}`",
                 ephemeral=True,
             )
+        except (ValueError, discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not create the rule: `{exc}`", ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)
-
+    @app_commands.command(name="automod-mention-spam", description="Create a native Discord AutoMod mention-spam rule.")
+    @app_commands.describe(limit="Maximum combined user/role mentions, from 1 to 50")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_mention_spam(self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 50]) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            rule = await interaction.guild.create_automod_rule(
+            rule = await interaction.guild.create_automod_rule(  # type: ignore[union-attr]
                 name="AstraCore • Mention Spam",
                 event_type=discord.AutoModRuleEventType.message_send,
-                trigger=discord.AutoModTrigger(
-                    mention_spam_limit=int(limit)
-                ),
-                actions=[
-                    discord.AutoModRuleAction(discord.AutoModRuleActionType.block_message)
-                ],
+                trigger=discord.AutoModTrigger(mention_limit=int(limit)),
+                actions=[self._block_action()],
                 enabled=True,
-                reason=f"AstraCore native AutoMod by {interaction.user}",
+                reason="AstraCore native AutoMod mention spam protection",
             )
+            await interaction.followup.send(f"✅ Mention-spam rule created. ID: `{rule.id}`", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not create the rule: `{exc}`", ephemeral=True)
 
-            await interaction.followup.send(
-                f"✅ Native mention-spam rule created.\n"
-                f"**Limit:** `{limit}` mentions\n"
-                f"**Rule ID:** `{rule.id}`",
-                ephemeral=True,
-            )
-
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "❌ Discord denied this action. AstraCore needs **Manage Server**.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as e:
-            await interaction.followup.send(
-                f"❌ Discord API error: `{e}`",
-                ephemeral=True,
-            )
-
-    @app_commands.command(
-        name="automod-list",
-        description="List native Discord AutoMod rules."
-    )
+    @app_commands.command(name="automod-spam", description="Create the native Discord spam-content AutoMod rule.")
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def automod_list(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return await interaction.response.send_message(
-                "❌ This command can only be used in a server.",
-                ephemeral=True,
+    @app_commands.guild_only()
+    async def automod_spam(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rule = await interaction.guild.create_automod_rule(  # type: ignore[union-attr]
+                name="AstraCore • Spam Content",
+                event_type=discord.AutoModRuleEventType.message_send,
+                trigger=discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam),
+                actions=[self._block_action()],
+                enabled=True,
+                reason="AstraCore native Discord spam protection",
             )
+            await interaction.followup.send(f"✅ Spam-content rule created. ID: `{rule.id}`", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not create the rule: `{exc}`", ephemeral=True)
+
+    @app_commands.command(name="automod-harmful-links", description="Create Discord's native harmful-link AutoMod rule.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_harmful_links(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rule = await interaction.guild.create_automod_rule(  # type: ignore[union-attr]
+                name="AstraCore • Harmful Links",
+                event_type=discord.AutoModRuleEventType.message_send,
+                trigger=discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.harmful_link),
+                actions=[self._block_action()],
+                enabled=True,
+                reason="AstraCore native Discord harmful-link protection",
+            )
+            await interaction.followup.send(f"✅ Harmful-link rule created. ID: `{rule.id}`", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not create the rule: `{exc}`", ephemeral=True)
+
+    @app_commands.command(name="automod-setup", description="Install AstraCore's useful native AutoMod baseline for this server.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_setup(self, interaction: discord.Interaction) -> None:
+        """Create a practical 5-rule baseline without duplicating existing AstraCore rules."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        created: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
 
         try:
-            rules = await interaction.guild.fetch_automod_rules()
+            for name, terms in self.SETUP_RULES:
+                if await self._rule_exists(guild, name):
+                    skipped.append(name)
+                    continue
+                try:
+                    await self._create_keyword_rule(guild, name, terms)
+                    created.append(name)
+                except (discord.Forbidden, discord.HTTPException, ValueError):
+                    failed.append(name)
 
-            if not rules:
-                return await interaction.response.send_message(
-                    "🛡️ No native Discord AutoMod rules found.",
-                    ephemeral=True,
-                )
+            if not await self._rule_exists(guild, "AstraCore • Spam Content"):
+                try:
+                    await guild.create_automod_rule(
+                        name="AstraCore • Spam Content",
+                        event_type=discord.AutoModRuleEventType.message_send,
+                        trigger=discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.spam),
+                        actions=[self._block_action()],
+                        enabled=True,
+                        reason="AstraCore native Discord spam protection",
+                    )
+                    created.append("AstraCore • Spam Content")
+                except (discord.Forbidden, discord.HTTPException):
+                    failed.append("AstraCore • Spam Content")
+            else:
+                skipped.append("AstraCore • Spam Content")
 
-            lines = []
+            if not await self._rule_exists(guild, "AstraCore • Mention Spam"):
+                try:
+                    await guild.create_automod_rule(
+                        name="AstraCore • Mention Spam",
+                        event_type=discord.AutoModRuleEventType.message_send,
+                        trigger=discord.AutoModTrigger(mention_limit=10),
+                        actions=[self._block_action()],
+                        enabled=True,
+                        reason="AstraCore native Discord mention spam protection",
+                    )
+                    created.append("AstraCore • Mention Spam")
+                except (discord.Forbidden, discord.HTTPException):
+                    failed.append("AstraCore • Mention Spam")
+            else:
+                skipped.append("AstraCore • Mention Spam")
 
-            for rule in rules[:20]:
-                status = "🟢 Enabled" if rule.enabled else "🔴 Disabled"
-                lines.append(
-                    f"**{rule.name}**\n"
-                    f"`{rule.id}` • {status}"
-                )
+            rules = await self._fetch_rules(guild)
+            lines = [f"**Native AutoMod rules in this server:** `{len(rules)}`"]
+            if created:
+                lines.append(f"✅ Created: `{len(created)}`")
+            if skipped:
+                lines.append(f"↪️ Already existed: `{len(skipped)}`")
+            if failed:
+                lines.append(f"⚠️ Failed: `{len(failed)}` — check Manage Server permission and Discord rule limits.")
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ AutoMod setup failed: `{exc}`", ephemeral=True)
 
-            embed = discord.Embed(
-                title="🛡️ AstraCore Native AutoMod",
-                description="\n\n".join(lines),
-                color=discord.Color.red(),
-            )
-
-            await interaction.response.send_message(
-                embed=embed,
-                ephemeral=True,
-            )
-
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "❌ Discord denied access to AutoMod rules.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as e:
-            await interaction.response.send_message(
-                f"❌ Discord API error: `{e}`",
-                ephemeral=True,
-            )
-
-    @app_commands.command(
-        name="automod-delete",
-        description="Delete a native Discord AutoMod rule."
-    )
+    @app_commands.command(name="automod-list", description="List native Discord AutoMod rules in this server.")
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def automod_delete(
-        self,
-        interaction: discord.Interaction,
-        rule_id: str,
-    ):
-        if not interaction.guild:
-            return await interaction.response.send_message(
-                "❌ This command can only be used in a server.",
-                ephemeral=True,
-            )
+    @app_commands.guild_only()
+    async def automod_list(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rules = await self._fetch_rules(interaction.guild)  # type: ignore[arg-type]
+            if not rules:
+                return await interaction.followup.send("No native AutoMod rules found.", ephemeral=True)
+            embed = discord.Embed(title="🛡️ AstraCore Native AutoMod", description=f"Rules: `{len(rules)}`")
+            for rule in rules[:25]:
+                embed.add_field(name=rule.name, value=f"ID: `{rule.id}` • {'Enabled' if rule.enabled else 'Disabled'}", inline=False)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not fetch AutoMod rules: `{exc}`", ephemeral=True)
 
+    @app_commands.command(name="automod-delete", description="Delete a native Discord AutoMod rule by ID.")
+    @app_commands.describe(rule_id="The AutoMod rule ID")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def automod_delete(self, interaction: discord.Interaction, rule_id: str) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             rule_id_int = int(rule_id)
-        except ValueError:
-            return await interaction.response.send_message(
-                "❌ Invalid AutoMod rule ID.",
-                ephemeral=True,
-            )
+            rules = await self._fetch_rules(interaction.guild)  # type: ignore[arg-type]
+            rule = next((item for item in rules if item.id == rule_id_int), None)
+            if rule is None:
+                return await interaction.followup.send("❌ AutoMod rule not found in this server.", ephemeral=True)
+            await rule.delete(reason="AstraCore native AutoMod rule deletion")
+            await interaction.followup.send(f"✅ Deleted **{rule.name}** (`{rule.id}`).", ephemeral=True)
+        except (ValueError, discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"❌ Could not delete the rule: `{exc}`", ephemeral=True)
 
-        try:
-            rule = await interaction.guild.fetch_automod_rule(rule_id_int)
+    @app_commands.command(name="automod-progress", description="Show AstraCore's native AutoMod rule count across accessible servers.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def automod_progress(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        total = 0
+        checked = 0
+        failed = 0
+        for guild in self.bot.guilds:
+            try:
+                total += len(await self._fetch_rules(guild))
+                checked += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+        await interaction.followup.send(
+            "🛡️ **AstraCore AutoMod Progress**\n"
+            f"Native rules visible to AstraCore: **{total}/100**\n"
+            f"Servers checked: `{checked}` • Failed: `{failed}`\n\n"
+            "Discord's AutoMod badge is controlled by Discord; reaching the documented threshold does not provide a manual claim button.",
+            ephemeral=True,
+        )
 
-            await interaction.guild.delete_automod_rule(
-                rule.id,
-                reason=f"AstraCore native AutoMod deletion by {interaction.user}",
-            )
-
-            await interaction.response.send_message(
-                f"✅ Deleted native AutoMod rule `{rule.name}`.",
-                ephemeral=True,
-            )
-
-        except discord.NotFound:
-            await interaction.response.send_message(
-                "❌ AutoMod rule not found.",
-                ephemeral=True,
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "❌ Discord denied this action. AstraCore needs **Manage Server**.",
-                ephemeral=True,
-            )
-        except discord.HTTPException as e:
-            await interaction.response.send_message(
-                f"❌ Discord API error: `{e}`",
-                ephemeral=True,
-            )
-
-    # -------------------------
-    # Native AutoMod execution
-    # -------------------------
     @commands.Cog.listener()
-    async def on_automod_action(self, execution: discord.AutoModAction):
-        guild = self.bot.get_guild(execution.guild_id)
-
-        if guild is None:
-            return
-
-        channel = None
-
-        if execution.channel_id:
-            channel = guild.get_channel(execution.channel_id)
-
-        if channel is None:
-            return
-
-        try:
-            embed = discord.Embed(
-                title="🛡️ Native AutoMod Action",
-                description=(
-                    "Discord AutoMod blocked an automated moderation event."
-                ),
-                color=discord.Color.red(),
-            )
-            embed.add_field(
-                name="Rule ID",
-                value=f"`{execution.rule_id}`",
-                inline=True,
-            )
-            embed.add_field(
-                name="Action",
-                value=f"`{execution.action.type.name}`",
-                inline=True,
-            )
-
-            await channel.send(embed=embed, delete_after=10)
-
-        except discord.HTTPException:
-            return
+    async def on_automod_action(self, execution: discord.AutoModAction) -> None:
+        # Keep this lightweight: Discord sends this event for every AutoMod execution.
+        if execution.guild_id:
+            self.bot.dispatch("astracore_automod_action", execution)
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AutoMod(bot))
