@@ -286,21 +286,31 @@ class AutoMod(commands.Cog):
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.guild_only()
     async def automod_maximize(self, interaction: discord.Interaction) -> None:
-        """Provision every useful native rule AstraCore can create in this server."""
+        """Provision useful native rules without allowing Discord API calls to hang the interaction."""
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         assert guild is not None
         try:
-            created, skipped, failed, total = await self._ensure_baseline(guild)
+            created, skipped, failed, total = await asyncio.wait_for(
+                self._ensure_baseline(guild),
+                timeout=35,
+            )
             await interaction.followup.send(
                 "🛡️ **AstraCore AutoMod Maximized**\n"
                 f"Native rules now: **{total}**\n"
-                f"✅ Created: `{len(created)}` • ↪️ Existing: `{len(skipped)}` • ⚠️ Failed: `{len(failed)}`\n\n"
-                "AstraCore only creates useful missing rules; it never deletes or duplicates existing rules.",
+                f"✅ Created: `{len(created)}` • ↪️ Existing: `{len(skipped)}` • ⚠️ Failed: `{len(failed)}`",
+                ephemeral=True,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "⚠️ **AutoMod operation timed out safely.** Discord did not answer within 35 seconds, so AstraCore stopped waiting instead of leaving the command stuck.",
                 ephemeral=True,
             )
         except (discord.Forbidden, discord.HTTPException) as exc:
-            await interaction.followup.send(f"❌ Could not maximize AutoMod: `{exc}`", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ Could not maximize AutoMod: `{exc}`",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="automod-maximize-owned", description="Maximize AutoMod in servers you own where AstraCore is installed.")
     @app_commands.checks.has_permissions(administrator=True)
